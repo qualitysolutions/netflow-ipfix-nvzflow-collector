@@ -487,20 +487,81 @@ class IPFIXFieldTypes:
         (491, "bgpDestinationLargeCommunityList", "basicList"),
     ]
 
+    cisco_field_types = [
+        (12332, "nvzFlowUDID", "octetArray"),
+        (12333, "nvzFlowLoggedInUser", "string"),
+        (12334, "nvzFlowOSName", "string"),
+        (12335, "nvzFlowOSVersion", "string"),
+        (12336, "nvzFlowSystemManufacturer", "string"),
+        (12337, "nvzFlowSystemType", "string"),
+        (12338, "nvzFlowProcessAccount", "string"),
+        (12339, "nvzFlowParentProcessAccount", "string"),
+        (12340, "nvzFlowProcessName", "string"),
+        (12341, "nvzFlowProcessHash", "octetArray"),
+        (12342, "nvzFlowParentProcessName", "string"),
+        (12343, "nvzFlowParentProcessHash", "octetArray"),
+        (12344, "nvzFlowDNSSuffix", "string"),
+        (12345, "nvzFlowDestinationHostname", "string"),
+        (12346, "nvzFlowL4ByteCountIn", "unsigned64"),
+        (12347, "nvzFlowL4ByteCountOut", "unsigned64"),
+        (12351, "nvzFlowOSEdition", "string"),
+        (12352, "nvzFlowModuleNameList", "basicList<string>"),
+        (12353, "nvzFlowModuleHashList", "basicList<octetArray>"),
+        (12355, "nvzFlowInterfaceInfoUID", "unsigned32"),
+        (12356, "nvzFlowInterfaceIndex", "unsigned32"),
+        (12357, "nvzFlowInterfaceType", "unsigned8"),
+        (12358, "nvzFlowInterfaceName", "string"),
+        (12359, "nvzFlowInterfaceDetailsList", "basicList<string>"),
+        (12361, "nvzFlowLoggedInUserAccountType", "unsigned16"),
+        (12362, "nvzFlowProcessAccountType", "unsigned16"),
+        (12363, "nvzFlowParentProcessAccountType", "unsigned16"),
+        (12364, "nvzFlowAgentVersion", "string"),
+        (12365, "nvzFlowProcessID", "unsigned32"),
+        (12366, "nvzFlowParentProcessID", "unsigned32"),
+        (12367, "nvzFlowProcessPath", "string"),
+        (12368, "nvzFlowParentProcessPath", "string"),
+        (12369, "nvzFlowProcessArgs", "string"),
+        (12370, "nvzFlowParentProcessArgs", "string"),
+        (12371, "nvzFlowStartMsec", "unsigned64"),
+        (12372, "nvzFlowEndMsec", "unsigned64"),
+        (12373, "nvzFlowCoordinatesList", "basicList<float32>"),
+        (12374, "nvzFlowProcessIntegrityLevel", "unsigned16"),
+        (12375, "nvzFlowParentProcessIntegrityLevel", "unsigned16"),
+        (12376, "nvzFlowProcessElevation", "unsigned8"),
+        (12377, "nvzFlowVirtualStationName", "string"),
+        (12383, "nvzFlowProcessImagePath", "string"),
+        (12384, "nvzFlowParentProcessImagePath", "string"),
+        (12385, "nvzFlowProcessCommandLine", "string"),
+        (12386, "nvzFlowParentProcessCommandLine", "string"),
+        (12387, "nvzFlowDeviceName", "string"),
+    ]
+
     @classmethod
     @functools.lru_cache(maxsize=128)
-    def by_id(cls, id_: int) -> Optional[FieldType]:
-        for item in cls.iana_field_types:
-            if item[0] == id_:
-                return FieldType(*item)
+    def by_id(cls, id_: int, enterprise_number: Optional[int]) -> Optional[FieldType]:
+        # Default to IANA
+        if enterprise_number in (None, 0):
+            for item in cls.iana_field_types:
+                if item[0] == id_:
+                    return FieldType(*item)
+        elif enterprise_number == 9:  # Cisco's Private Enterprise Number
+            for item in cls.cisco_field_types:
+                if item[0] == id_:
+                    return FieldType(*item)
+
         return None
 
     @classmethod
     @functools.lru_cache(maxsize=128)
-    def by_name(cls, key: str) -> Optional[FieldType]:
-        for item in cls.iana_field_types:
-            if item[1] == key:
-                return FieldType(*item)
+    def by_name(cls, key: str, enterprise_number: Optional[int] = None) -> Optional[FieldType]:
+        if enterprise_number in (None, 0):
+            for item in cls.iana_field_types:
+                if item[1] == key:
+                    return FieldType(*item)
+        elif enterprise_number == 9:  # Cisco's Private Enterprise Number
+            for item in cls.cisco_field_types:
+                if item[1] == key:
+                    return FieldType(*item)
         return None
 
     @classmethod
@@ -727,11 +788,14 @@ class IPFIXDataRecord:
             field_type_id = field.id
             field_length = field.length
             offset += field_length
+            enterprise_number = getattr(field, 'enterprise_number', 0)
+
+            field_type = IPFIXFieldTypes.by_id(field_type_id, enterprise_number)
 
             # Here, reduced-size encoding of fields blocks the usage of IPFIXFieldTypes.get_type_unpack.
             # See comment in IPFIXFieldTypes.get_type_unpack for more information.
 
-            field_type = IPFIXFieldTypes.by_id(field_type_id)  # type: Optional[FieldType]
+            # field_type = IPFIXFieldTypes.by_id(field_type_id)  # type: Optional[FieldType]
             if not field_type and type(field) is not TemplateFieldEnterprise:
                 # This should break, since the exporter seems to use a field identifier
                 # which is not standardized by IANA.
@@ -794,9 +858,157 @@ class IPFIXDataRecord:
 
     @property
     def data(self):
-        return {
-            IPFIXFieldTypes.by_id(key)[1]: value for (key, value) in self.fields
-        }
+        def decode_value(val, datatype):
+
+            def decode_basic_list_octetarray(raw: bytes) -> list:
+                items = []
+
+                if len(raw) < 8:
+                    return items  # Too short to be a valid basicList
+
+                offset = 8  # Skip the basicList header
+
+                while offset < len(raw):
+                    if offset >= len(raw):
+                        break
+
+                    length = raw[offset]
+                    offset += 1
+
+                    if offset + length > len(raw):
+                        break  # Corrupt or truncated
+
+                    chunk = raw[offset:offset + length]
+                    # Use hex for octetArray
+                    items.append(chunk.hex())
+                    offset += length
+
+                return items
+
+            def decode_basic_list_float32(raw: bytes) -> list:
+                items = []
+
+                if len(raw) < 8:
+                    return items  # too short to contain basicList header
+
+                offset = 8  # Skip 8-byte basicList header
+
+                while offset < len(raw):
+                    if offset + 5 > len(raw):  # 1 byte for length, 4 for float32
+                        break
+
+                    length = raw[offset]
+                    offset += 1
+
+                    if length != 4 or offset + length > len(raw):
+                        break  # Only expect 4-byte float values
+
+                    try:
+                        item = struct.unpack("!f", raw[offset:offset + length])[0]
+                    except Exception:
+                        item = None  # Or you could `item = raw[offset:offset + length].hex()` if you prefer
+
+                    items.append(item)
+                    offset += length
+
+                return items
+
+            def decode_basic_list_string(raw: bytes) -> list:
+                items = []
+
+                if len(raw) < 9:
+                    return items  # too short to contain basicList header
+
+                # Skip the 8-byte header (1 elementID + 2 reserved + 2 length + 3 enterpriseID bytes)
+                offset = 9
+
+                while offset < len(raw):
+                    length = raw[offset]
+                    offset += 1
+
+                    # If we hit the end or corrupt length
+                    if offset + length > len(raw):
+                        break
+
+                    try:
+                        item = raw[offset:offset + length].decode('utf-8', errors='replace').strip()
+                    except Exception:
+                        item = raw[offset:offset + length].hex()
+
+                    items.append(item)
+                    offset += length
+                return items
+
+            if isinstance(val, bytes):
+                if datatype == "string":
+                    try:
+                        return val.decode('utf-8', errors='replace').strip()
+                    except Exception:
+                        return val.hex()
+                elif datatype == "basicList<string>":
+                    if val[:4] == b'\x03\xb0':
+                        print("Warning: Unexpected header bytes in string list")
+                    return decode_basic_list_string(val)
+                elif datatype == "basicList<float32>":
+                    return decode_basic_list_float32(val)
+                elif datatype == "basicList<octetArray>":
+                    return decode_basic_list_octetarray(val)
+                elif datatype == "octetArray":
+                    try:
+                        decoded = val.decode("utf-8")
+                        if all(c.isprintable() or c.isspace() for c in decoded):
+                            return decoded.strip()
+                        else:
+                            return val.hex()
+                    except Exception:
+                        return val.hex()
+                elif datatype == "boolean":
+                    return True if val == b'\x01' else False
+                elif datatype == "dateTimeSeconds":
+                    return int.from_bytes(val, "big")
+                elif datatype == "dateTimeMilliseconds":
+                    return int.from_bytes(val, "big")
+                elif datatype == "dateTimeMicroseconds":
+                    seconds = int.from_bytes(val[:4], "big")
+                    micros = int.from_bytes(val[4:], "big")
+                    return (seconds, micros)
+                elif datatype == "dateTimeNanoseconds":
+                    seconds = int.from_bytes(val[:4], "big")
+                    nanos = int.from_bytes(val[4:], "big")
+                    return (seconds, nanos)
+                elif datatype == "ipv4Address":
+                    return ".".join(str(b) for b in val)
+                elif datatype == "ipv6Address":
+                    return ":".join(f"{val[i]:02x}{val[i + 1]:02x}" for i in range(0, 16, 2))
+                elif datatype.startswith("unsigned"):
+                    return int.from_bytes(val, "big")
+                elif datatype.startswith("signed"):
+                    return int.from_bytes(val, "big", signed=True)
+                elif datatype.startswith("float"):
+                    import struct
+                    fmt = "f" if "32" in datatype else "d"
+                    return struct.unpack("!" + fmt, val)[0]
+                else:
+                    print(f"Warning: unhandled datatype '{datatype}', using .hex fallback")
+                    return val.hex()
+            return val
+
+        result = {}
+        for field, value in self.fields.items():
+            try:
+                enterprise_number = getattr(field, 'enterprise_number', 0)
+                field_type_id = field.id
+                field_info = IPFIXFieldTypes.by_id(field_type_id, enterprise_number)
+                if field_info:
+                    name = field_info.name
+                    datatype = field_info.type
+                    result[name] = decode_value(value, datatype)
+                else:
+                    result[f"UNKNOWN_FIELD_{field_type_id}"] = value.hex() if isinstance(value, bytes) else value
+            except Exception:
+                result[f"UNKNOWN_FIELD_{getattr(field, 'id', 'N/A')}"] = value.hex() if isinstance(value,
+                                                                                                   bytes) else value
+        return result
 
     def __repr__(self):
         return "<IPFIXDataRecord with {} entries>".format(len(self.fields))
@@ -855,35 +1067,82 @@ class IPFIXSet:
                     # Rest should be padding zeroes
                     break
 
-        elif self.header.set_id >= 256:  # data set, set_id is template id
-            # First, get the template behind the ID. Returns a list of fields or raises an exception
-            template_fields = templates.get(
-                self.header.set_id)  # type: List[Union[TemplateField, TemplateFieldEnterprise]]
+
+        elif self.header.set_id >= 256:  # data set, set_id is template ID
+
+            template_fields = templates.get(self.header.set_id)
+
             if not template_fields:
                 raise IPFIXTemplateNotRecognized
 
-            # All template fields have a known length. Add them all together to get the length of the data set.
-            dataset_length = functools.reduce(lambda a, x: a + x.length, template_fields, 0)
+            while offset < self.header.length:
 
-            # This is the last possible offset value possible if there's no padding.
-            # If there is padding, this value marks the beginning of the padding.
-            # Two cases possible:
-            # 1. No padding: then (4 + x * dataset_length) == self.header.length
-            # 2. Padding: then (4 + x * dataset_length + p) == self.header.length,
-            #    where p is the remaining length of padding zeroes. The modulo calculates p
-            no_padding_last_offset = self.header.length - ((self.header.length - IPFIXSetHeader.size) % dataset_length)
+                record_data = {}
 
-            while offset < no_padding_last_offset:
-                data_record = IPFIXDataRecord(data[offset:], template_fields)
+                record_offset = offset
+
+                for field in template_fields:
+
+                    if offset >= len(data):
+                        raise PaddingCalculationError
+
+                    if field.length == 65535:
+
+                        # Variable-length field
+
+                        first_len_byte = data[offset]
+
+                        if first_len_byte < 255:
+
+                            actual_len = first_len_byte
+
+                            offset += 1
+
+                        else:
+
+                            if offset + 2 >= len(data):
+                                raise PaddingCalculationError
+
+                            actual_len = int.from_bytes(data[offset + 1:offset + 3], byteorder="big")
+
+                            offset += 3
+
+                        # value = data[offset:offset + actual_len]
+                        # offset += actual_len
+
+                        value = data[offset:offset + actual_len]
+                        offset += actual_len
+
+                        # # ⚠️ Handle Cisco's enterprise basicList<string> (field ID 12352)
+                        # if isinstance(field,
+                        #               TemplateFieldEnterprise) and field.id == 12352 and field.enterprise_number == 9:
+                        #     # Drop the 8-byte header, which includes field ID and enterprise number
+                        #     if value.startswith(b'\x03\xb0\x3c\xff\xff\x00\x00\x00\x09'):
+                        #         value = value[8:]
+
+                    else:
+
+                        actual_len = field.length
+
+                        value = data[offset:offset + actual_len]
+
+                        offset += actual_len
+
+                    record_data[field] = value
+
+                data_record = IPFIXDataRecord.__new__(IPFIXDataRecord)
+
+                data_record.fields = record_data
+
+                data_record.get_length = lambda: offset - record_offset
+
                 self.records.append(data_record)
-                offset += data_record.get_length()
 
-            # Safety check
-            if (
-                    offset != self.header.length
-                    and not rest_is_padding_zeroes(data[:self.header.length], offset)
-            ):
-                raise PaddingCalculationError
+                if offset >= self.header.length:
+                    break
+
+                if rest_is_padding_zeroes(data[:self.header.length], offset):
+                    break
 
         self._length = self.header.length
 
@@ -1015,6 +1274,23 @@ def parse_fields(data: bytes, count: int) -> (list, int):
             )
             offset += 4
     return fields, offset
+
+def decode_basic_list_string(raw: bytes) -> list:
+    items = []
+    offset = 0
+    while offset < len(raw):
+        length = raw[offset]
+        offset += 1
+        if offset + length > len(raw):
+            break  # malformed or truncated
+        try:
+            val = raw[offset:offset + length].decode('utf-8', errors='replace').strip()
+        except Exception:
+            val = raw[offset:offset + length].hex()
+        items.append(val)
+        offset += length
+    return items
+
 
 
 def rest_is_padding_zeroes(data: bytes, offset: int) -> bool:
